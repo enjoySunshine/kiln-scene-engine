@@ -363,7 +363,8 @@ class AnimComponent extends Component {
             this._activate,
             this,
             this.findParameter,
-            this.consumeTrigger
+            this.consumeTrigger,
+            () => this._speed
         );
         this._layers.push(new AnimComponentLayer(name, controller, this, weight, blendType));
         this._layerIndices[name] = layerIndex;

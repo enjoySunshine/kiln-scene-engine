@@ -196,11 +196,13 @@ class AnimEvaluator {
      * and the results set on the {@link AnimTarget}.
      *
      * @param {number} deltaTime - The amount of time that has passed since the last update, in
-     * seconds.
+     * seconds. Always non-negative; reverse playback is requested through the `reverse` argument.
      * @param {boolean} [outputAnimation] - Whether the evaluator should output the results of the
      * update to the bound animation targets.
+     * @param {boolean} [reverse] - Whether the clips should play in reverse. This is how an anim
+     * component with a negative playback rate drives its clips without a negative delta time.
      */
-    update(deltaTime, outputAnimation = true) {
+    update(deltaTime, outputAnimation = true, reverse = false) {
         // copy clips
         const clips = this._clips;
 
@@ -218,6 +220,9 @@ class AnimEvaluator {
             const inputs = this._inputs[index];
             const outputs = this._outputs[index];
             const blendWeight = clip.blendWeight;
+
+            // propagate the component's playback direction to the clip before updating it
+            clip.reverse = reverse;
 
             // update clip
             if (blendWeight > 0.0) {

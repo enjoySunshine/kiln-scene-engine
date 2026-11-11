@@ -41,6 +41,8 @@ class AnimClip {
         this._blendWeight = 1.0;        // blend weight 0..1
         this._blendOrder = 0.0;         // blend order relative to other clips
         this._eventHandler = eventHandler;
+        this._reverse = false;          // playback direction imposed by the owning anim component
+        this._lastDirection = 0;        // effective playback direction of the previous update
         this.alignCursorToCurrentTime();
     }
 
@@ -79,6 +81,9 @@ class AnimClip {
         this._speed = speed;
         if (signChanged) {
             this.alignCursorToCurrentTime();
+            // realign again on the next update, as the component's reverse flag can reverse the
+            // effective playback direction independently of the clip's own speed
+            this._lastDirection = 0;
         }
     }
 
@@ -92,6 +97,26 @@ class AnimClip {
 
     get loop() {
         return this._loop;
+    }
+
+    /**
+     * Sets whether the owning anim component drives this clip in reverse. A reverse component
+     * negates the effective playback direction of all its clips, so a positive-speed clip plays
+     * backwards and a negative-speed clip plays forwards.
+     *
+     * @type {boolean}
+     */
+    set reverse(value) {
+        if (value !== this._reverse) {
+            this._reverse = value;
+            // the effective playback direction changed, so the events ahead of the cursor are now
+            // behind it; realign the cursor on the next update
+            this._lastDirection = 0;
+        }
+    }
+
+    get reverse() {
+        return this._reverse;
     }
 
     set blendWeight(blendWeight) {
@@ -126,8 +151,11 @@ class AnimClip {
         return this._track.events[this._eventCursor];
     }
 
+    // The effective playback direction combines the clip's own speed with the reverse flag the
+    // owning anim component imposes. A reverse component playing a positive-speed clip therefore
+    // plays it backwards, while a negative-speed clip under the same component plays forwards.
     get isReverse() {
-        return this._speed < 0;
+        return this._speed < 0 !== this._reverse;
     }
 
     nextEventAheadOfTime(time) {
@@ -219,8 +247,18 @@ class AnimClip {
         if (this._playing) {
             let time = this._time;
             const duration = this._track.duration;
-            const speed = this._speed;
             const loop = this._loop;
+            const reverse = this.isReverse;
+            // the effective playback speed combines the clip's own speed with the component's
+            // reverse direction; deltaTime itself is always non-negative
+            const speed = reverse ? -Math.abs(this._speed) : Math.abs(this._speed);
+
+            // a change of playback direction means the events ahead of the cursor are now behind
+            // it, so the cursor has to be realigned to the current time
+            if (this._lastDirection !== 0 && Math.sign(speed) !== this._lastDirection) {
+                this.alignCursorToCurrentTime();
+            }
+            this._lastDirection = Math.sign(speed);
 
             // check for events that should fire during this frame
             if (this._track.events.length > 0 && duration > 0) {

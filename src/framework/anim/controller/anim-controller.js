@@ -121,12 +121,15 @@ class AnimController {
      * transition between states.
      * @param {Function} consumeTrigger - Used to set triggers back to their default state after
      * they have been consumed by a transition.
+     * @param {Function} [getComponentSpeed] - Returns the playback speed of the owning anim
+     * component. A negative value plays the component's states in reverse.
      */
-    constructor(animEvaluator, states, transitions, activate, eventHandler, findParameter, consumeTrigger) {
+    constructor(animEvaluator, states, transitions, activate, eventHandler, findParameter, consumeTrigger, getComponentSpeed = () => 1) {
         this._animEvaluator = animEvaluator;
         this._eventHandler = eventHandler;
         this._findParameter = findParameter;
         this._consumeTrigger = consumeTrigger;
+        this._getComponentSpeed = getComponentSpeed;
         for (let i = 0; i < states.length; i++) {
             this._states[states[i].name] = new AnimState(
                 this,
@@ -276,6 +279,19 @@ class AnimController {
         return activeClip ? activeClip.speed : this.activeState.speed;
     }
 
+    /**
+     * Whether the active state is currently playing in reverse. The component speed and the
+     * active clip speed each carry a direction, and the effective direction is the product of
+     * their signs: a negative component speed reverses a positive-speed clip and straightens out
+     * a negative-speed one.
+     *
+     * @type {boolean}
+     * @private
+     */
+    get _activeStateIsReverse() {
+        return this._getComponentSpeed() * this._activeStateTimeScale < 0;
+    }
+
     _getActiveStateProgressForTime(time) {
         if (this.activeStateName === ANIM_STATE_START || this.activeStateName === ANIM_STATE_END || this.activeStateName === ANIM_STATE_ANY) {
             return 1.0;
@@ -284,8 +300,10 @@ class AnimController {
         const activeClip = this._animEvaluator.findClip(this.activeStateAnimations[0].name);
         if (activeClip) {
             // the time in state advances at the clip speed, so it is already the clip's playback
-            // time. For a clip playing in reverse it runs from 0 towards negative values.
-            return (activeClip.speed < 0 ? -time : time) / activeClip.track.duration;
+            // time. It runs from 0 towards negative values while the state is effectively playing
+            // in reverse.
+            const reverse = this._getComponentSpeed() * activeClip.speed < 0;
+            return (reverse ? -time : time) / activeClip.track.duration;
         }
 
         return null;
@@ -545,11 +563,19 @@ class AnimController {
             } else {
                 clip.blendWeight = activeState.animations[i].normalizedWeight;
             }
+            // give the clip the component's playback direction before its start time is set, so its
+            // event cursor aligns to the time in the direction it will actually play
+            clip.reverse = this._getComponentSpeed() < 0;
             clip.play();
             if (hasTransitionOffset) {
                 clip.time = activeState.timelineDuration * transition.transitionOffset;
             } else {
-                const startTime = activeState.speed >= 0 ? 0 : this.activeStateDuration;
+                // a state that effectively plays in reverse starts at the end of its timeline. The
+                // effective direction combines the component speed with the animation's own speed.
+                // Use the timeline duration directly as activeStateDuration may not have been
+                // recalculated for the newly entered state yet
+                const stateSpeed = Number.isFinite(activeState.animations[i].speed) ? activeState.animations[i].speed : activeState.speed;
+                const startTime = this._getComponentSpeed() * stateSpeed < 0 ? activeState.timelineDuration : 0;
                 clip.time = startTime;
             }
         }
@@ -642,16 +668,42 @@ class AnimController {
         let state;
         let animation;
         let clip;
-        // update time when looping or when the active state is not at the end of its duration
-        if (this.activeState.loop || this._timeInState < this.activeStateDuration) {
+        // a reverse playing component passes a negative delta time into the layer. The clips are
+        // driven with the unsigned delta time and reverse through their own playback direction
+        // instead, so keep the original for the transition blend timers while clips get a positive one
+        const clipDt = Math.abs(dt);
+        // before the first state has been entered there is no timeline to advance: run the START
+        // transition first so it creates the active state and its clip. Otherwise the first frame
+        // accumulates time before the clip exists, and a reverse-playing state misses starting at
+        // the end of its timeline
+        if (this._activeStateName === ANIM_STATE_START) {
+            const startTransition = this._findTransition(this._activeStateName);
+            if (startTransition) {
+                this.updateStateFromTransition(startTransition);
+            }
+        }
+        // the effective playback direction depends on the now-active state's clip speed combined
+        // with the component speed, so compute it after the active state has been entered
+        const isReverse = this._activeStateIsReverse;
+        // update time when looping, or while the active state has not reached the end of its
+        // duration. A non-looping clip pauses itself at its end: the timeline end when playing
+        // forwards and the start (a time in state of minus the duration) when playing in reverse.
+        // Once the clip has paused, the time in state stays at that end rather than drifting
+        const activeClip = this.activeStateAnimations.length > 0 ?
+            this._animEvaluator.findClip(this.activeStateAnimations[0].name) : null;
+        const clipStillPlaying = !activeClip || activeClip._playing;
+        const timeInStateEnd = isReverse ? -this.activeStateDuration : this.activeStateDuration;
+        const hasReachedEnd = isReverse ? this._timeInState <= -this.activeStateDuration : this._timeInState >= this.activeStateDuration;
+        if (clipStillPlaying && (this.activeState.loop || !hasReachedEnd)) {
             const timeScale = this._activeStateTimeScale;
             this._timeInStateBefore = this._timeInState;
             this._timeInState += dt * timeScale;
-            // if the active state is not looping and the time in state is greater than the duration, set the time in state to the state duration
-            // and update the delta time accordingly. The time in state advances at the time scale, so divide by it to get back to real time
-            if (!this.activeState.loop && this._timeInState > this.activeStateDuration) {
-                this._timeInState = this.activeStateDuration;
-                dt = (this.activeStateDuration - this._timeInStateBefore) / timeScale;
+            // if the active state is not looping and the time in state has run past the end of its
+            // duration, set the time in state to that end and shorten the frame accordingly. The
+            // time in state advances at the time scale, so divide by it to get back to real time
+            if (!this.activeState.loop && (isReverse ? this._timeInState < timeInStateEnd : this._timeInState > timeInStateEnd)) {
+                this._timeInState = timeInStateEnd;
+                dt = (timeInStateEnd - this._timeInStateBefore) / timeScale;
             }
         }
 
@@ -717,7 +769,7 @@ class AnimController {
                 }
             }
         }
-        this._animEvaluator.update(dt, this.activeState.hasAnimations);
+        this._animEvaluator.update(clipDt, this.activeState.hasAnimations, this._getComponentSpeed() < 0);
     }
 
     findParameter = (name) => {
